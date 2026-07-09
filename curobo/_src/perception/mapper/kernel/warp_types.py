@@ -39,15 +39,10 @@ class BlockSparseTSDFWarp:
             Access: ``static_block_data[pool_idx, local_idx]``.
             Initialized to +inf (no obstacle).
 
-        block_rgb: (max_blocks, 4) float16
-            Per-block RGBW: [R*w, G*w, B*w, weight_sum]. One color per
-            block (not per voxel) - ``BLOCK_SIZE**3`` memory savings.
-            Integration pre-normalizes RGB to ``[0, 1]``; divide by
-            channel 3 at read time and multiply by 255 to get uint8 RGB.
-            A post-frame rescale kernel caps the weight at
-            ``config.accumulator_w_max`` so the fp16 accumulator stays
-            inside finite range and per-atomic ulp loss stays bounded.
-            Access: ``block_rgb[pool_idx, 0/1/2/3]``.
+        block_grid_rgb: (max_blocks, COLOR_GRID_SIZE**3, 4) float16
+            Per-block local RGBW control grid. Integration pre-normalizes
+            RGB to ``[0, 1]``; divide by channel 3 at read time and
+            multiply by 255 to get uint8 RGB.
 
         block_coords: (max_blocks * 3,) int32
             Signed centered hash block keys: [bx, by, bz] for each block.
@@ -67,11 +62,13 @@ class BlockSparseTSDFWarp:
 
     # Block pool - dynamic channel (depth integration)
     block_data: wp.array3d(dtype=wp.float16)  # (max_blocks, BLOCK_SIZE**3, 2) or (1, 1, 2) dummy
-    block_rgb: wp.array2d(dtype=wp.float16)  # (max_blocks, 4) per-block [R*w, G*w, B*w, W]
+    block_grid_rgb: wp.array3d(dtype=wp.float16)  # (max_blocks, color_grid_size**3, 4)
 
-    # Per-block feature channel (fp16 weighted sums + dedicated weight)
-    block_features: wp.array2d(dtype=wp.float16)  # (max_blocks, feature_dim) or (1, 1) dummy
-    block_feature_weight: wp.array(dtype=wp.float16)  # (max_blocks,) or (1,) dummy
+    # Per-block feature grid (fp16 weighted sums + dedicated weight)
+    # Shape: (max_blocks, feature_block_grid_size**3, feature_dim)
+    block_features: wp.array3d(dtype=wp.float16)
+    # Shape: (max_blocks, feature_block_grid_size**3)
+    block_feature_weight: wp.array2d(dtype=wp.float16)
 
     # Block pool - static channel (primitive SDF)
     static_block_data: wp.array2d(dtype=wp.float16)  # (max_blocks, BLOCK_SIZE**3) or (1, 1) dummy
@@ -81,6 +78,8 @@ class BlockSparseTSDFWarp:
     has_static: wp.bool  # True if static channel is enabled
     has_features: wp.bool  # True if per-block feature channel is enabled
     feature_dim: int  # 0 when the feature channel is disabled
+    color_grid_size: int
+    feature_block_grid_size: int
 
     # Block metadata
     block_coords: wp.array(dtype=wp.int32)  # (max_blocks * 3,) signed block keys

@@ -44,6 +44,7 @@ Usage:
 """
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -56,11 +57,13 @@ from curobo._src.perception.mapper.block_allocation import (
 )
 from curobo._src.perception.mapper.constants import (
     DEFAULT_HASH_LAYOUT,
+    _validate_block_size,
+    _validate_color_grid_size,
+    _validate_feature_block_grid_size,
     _validate_feature_channels_per_thread,
     _validate_feature_grid_shape,
     _validate_feature_integration_kernel,
     _validate_lidar_config,
-    _validate_block_size,
     validate_grid_shape_for_hash_layout,
 )
 from curobo._src.perception.mapper.esdf.edt_jump_flooding import JumpFloodingEDT
@@ -87,9 +90,8 @@ from curobo._src.perception.mapper.storage import (
 from curobo._src.types.camera import CameraObservation
 from curobo._src.types.lidar import LidarObservation
 from curobo._src.util.cuda_graph_util import GraphExecutor
-from curobo._src.util.logging import log_info
+from curobo._src.util.logging import log_and_raise, log_info
 from curobo._src.util.torch_util import profile_class_methods
-from curobo.logging import log_and_raise
 
 
 @dataclass
@@ -149,6 +151,13 @@ class BlockSparseESDFIntegratorCfg:
     grid_shape: Tuple[int, int, int] = None
     image_height: Optional[int] = None  # For buffer pre-allocation
     image_width: Optional[int] = None  # For buffer pre-allocation
+    #: Number of RGB cameras used by projective texture export. Defaults to
+    #: ``num_cameras`` when unset.
+    texture_num_cameras: Optional[int] = None
+    #: RGB texture camera image height in pixels. Defaults to ``image_height``.
+    texture_camera_image_height: Optional[int] = None
+    #: RGB texture camera image width in pixels. Defaults to ``image_width``.
+    texture_camera_image_width: Optional[int] = None
     lidar_num_sensors: int = 0
     lidar_image_height: Optional[int] = None
     lidar_image_width: Optional[int] = None
@@ -173,6 +182,9 @@ class BlockSparseESDFIntegratorCfg:
     block_size: int = 8
     #: Per-block feature channel dimensionality. 0 disables features.
     feature_dim: int = 0
+    #: Number of feature control points per block edge. Independent from the
+    #: incoming camera and LiDAR feature image dimensions.
+    feature_block_grid_size: int = 1
     #: Compile-time feature-grid height. Required when ``feature_dim > 0``;
     #: must be ``None`` when features are disabled.
     feature_grid_height: Optional[int] = None
@@ -191,6 +203,9 @@ class BlockSparseESDFIntegratorCfg:
     #: Compile-time cap for feature channels accumulated by one tiled
     #: feature-kernel CTA.
     max_feature_tile_channels: int = 4096
+    #: Number of RGBW control points per block edge. This is a construction-time
+    #: kernel specialization value.
+    color_grid_size: int = 1
     #: Feature integration launch policy: ``"auto"``, ``"grouped"``, or
     #: ``"tiled"``. Resolved by the TSDF integrator to the low-level launch bool.
     feature_integration_kernel: str = "auto"
@@ -287,6 +302,49 @@ class BlockSparseESDFIntegratorCfg:
                 "max_support_pixels_per_block_camera must be positive: "
                 f"{self.max_support_pixels_per_block_camera}"
             )
+        if self.image_height is None or self.image_width is None:
+            log_and_raise(
+                "BlockSparseESDFIntegratorCfg requires image_height and image_width. "
+                f"Got image_height={self.image_height}, image_width={self.image_width}."
+            )
+        if self.image_height <= 0 or self.image_width <= 0:
+            log_and_raise(
+                "image_height and image_width must be positive, got "
+                f"image_height={self.image_height}, image_width={self.image_width}."
+            )
+        if self.num_cameras <= 0:
+            log_and_raise(f"num_cameras must be positive, got num_cameras={self.num_cameras}.")
+        if (
+            self.texture_camera_image_height is None
+        ) != (self.texture_camera_image_width is None):
+            log_and_raise(
+                "texture_camera_image_height and texture_camera_image_width must be "
+                "specified together."
+            )
+        if self.texture_num_cameras is None:
+            self.texture_num_cameras = self.num_cameras
+        if self.texture_camera_image_height is None:
+            self.texture_camera_image_height = self.image_height
+            self.texture_camera_image_width = self.image_width
+        if self.texture_num_cameras <= 0:
+            log_and_raise(
+                "texture_num_cameras must be positive, got "
+                f"texture_num_cameras={self.texture_num_cameras}."
+            )
+        if (
+            self.texture_camera_image_height <= 0
+            or self.texture_camera_image_width <= 0
+        ):
+            log_and_raise(
+                "texture_camera_image_height and texture_camera_image_width must be "
+                "positive, got "
+                f"{self.texture_camera_image_height}x{self.texture_camera_image_width}."
+            )
+        _validate_color_grid_size(self.color_grid_size, self.block_size)
+        _validate_feature_block_grid_size(
+            self.feature_block_grid_size,
+            self.block_size,
+        )
         _validate_feature_integration_kernel(self.feature_integration_kernel)
         if not isinstance(self.profile_integration_kernel_timings, bool):
             log_and_raise(
@@ -359,6 +417,9 @@ class BlockSparseESDFIntegrator:
             grid_shape=config.grid_shape,
             image_height=config.image_height,
             image_width=config.image_width,
+            texture_num_cameras=config.texture_num_cameras,
+            texture_camera_image_height=config.texture_camera_image_height,
+            texture_camera_image_width=config.texture_camera_image_width,
             lidar_num_sensors=config.lidar_num_sensors,
             lidar_image_height=config.lidar_image_height,
             lidar_image_width=config.lidar_image_width,
@@ -381,12 +442,14 @@ class BlockSparseESDFIntegrator:
             device=config.device,
             block_size=config.block_size,
             feature_dim=config.feature_dim,
+            feature_block_grid_size=config.feature_block_grid_size,
             feature_grid_height=config.feature_grid_height,
             feature_grid_width=config.feature_grid_width,
             max_visible_blocks_per_integration=config.max_visible_blocks_per_integration,
             max_support_pixels_per_block_camera=config.max_support_pixels_per_block_camera,
             feature_channels_per_thread=config.feature_channels_per_thread,
             max_feature_tile_channels=config.max_feature_tile_channels,
+            color_grid_size=config.color_grid_size,
             feature_integration_kernel=config.feature_integration_kernel,
             profile_integration_kernel_timings=config.profile_integration_kernel_timings,
             accumulator_w_max=config.accumulator_w_max,
@@ -706,11 +769,11 @@ class BlockSparseESDFIntegrator:
     # =========================================================================
     def extract_mesh(
         self,
-        refine_iterations: int = 2,
+        refine_iterations: int = 0,
         surface_only: bool = True,
         level: float = 0.0,
     ) -> Mesh:
-        """Extract mesh using GPU marching cubes.
+        """Extract a triangle-soup mesh using GPU marching cubes.
 
         Args:
             refine_iterations: Newton-Raphson iterations for vertex refinement.
@@ -728,10 +791,38 @@ class BlockSparseESDFIntegrator:
 
         return mesh
 
+    def extract_textured_mesh(
+        self,
+        texture_observations: CameraObservation | Sequence[CameraObservation],
+        refine_iterations: int = 0,
+        surface_only: bool = True,
+        level: float = 0.0,
+        camera_min_distance: Optional[float] = None,
+        camera_max_distance: Optional[float] = None,
+        texture_depth_tolerance_m: Optional[float] = None,
+    ) -> Mesh:
+        """Extract a TSDF mesh with visibility-tested RGB texture."""
+        return self._tsdf_integrator.extract_textured_mesh(
+            texture_observations=texture_observations,
+            refine_iterations=refine_iterations,
+            surface_only=surface_only,
+            level=level,
+            camera_min_distance=camera_min_distance,
+            camera_max_distance=camera_max_distance,
+            texture_depth_tolerance_m=texture_depth_tolerance_m,
+        )
+
     def extract_occupied_voxels(
         self,
         surface_only: bool = False,
         sdf_threshold: Optional[float] = None,
+        *,
+        subvoxel_factor: int = 1,
+        max_points: Optional[int] = None,
+        texture_observations: CameraObservation | Sequence[CameraObservation] | None = None,
+        camera_min_distance: Optional[float] = None,
+        camera_max_distance: Optional[float] = None,
+        texture_depth_tolerance_m: Optional[float] = None,
     ) -> OccupiedVoxels:
         """Extract occupied voxel centers and per-voxel block indices.
 
@@ -747,6 +838,12 @@ class BlockSparseESDFIntegrator:
         return self._tsdf_integrator.extract_occupied_voxels(
             surface_only=surface_only,
             sdf_threshold=sdf_threshold,
+            subvoxel_factor=subvoxel_factor,
+            max_points=max_points,
+            texture_observations=texture_observations,
+            camera_min_distance=camera_min_distance,
+            camera_max_distance=camera_max_distance,
+            texture_depth_tolerance_m=texture_depth_tolerance_m,
         )
 
     def extract_matching_feature_voxels(

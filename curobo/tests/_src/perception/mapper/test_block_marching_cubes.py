@@ -11,9 +11,7 @@ from curobo._src.perception.mapper.integrator_tsdf import (
     BlockSparseTSDFIntegrator,
     BlockSparseTSDFIntegratorCfg,
 )
-from curobo._src.perception.mapper.mesh_extractor import (
-    extract_mesh_block_sparse,
-)
+from curobo._src.perception.mapper.mesh_extractor import extract_mesh_block_sparse
 from curobo._src.util.warp import init_warp
 from curobo.tests._src.perception.mapper.conftest import make_observation
 
@@ -51,6 +49,12 @@ def identity_pose(device):
     return position, quaternion
 
 
+def _identity_triangles(vertices: torch.Tensor) -> torch.Tensor:
+    return torch.arange(vertices.shape[0], dtype=torch.int32, device=vertices.device).view(
+        -1, 3
+    )
+
+
 # =============================================================================
 # Tests
 # =============================================================================
@@ -73,10 +77,10 @@ class TestMarchingCubes:
         integrator = BlockSparseTSDFIntegrator(config)
         tsdf = integrator.tsdf
 
-        vertices, triangles, normals, colors = extract_mesh_block_sparse(tsdf)
+        vertices, normals, colors = extract_mesh_block_sparse(tsdf)
 
         assert vertices.shape == (0, 3)
-        assert triangles.shape == (0, 3)
+        assert normals.shape == (0, 3)
         assert colors.shape == (0, 3)
 
     def test_flat_plane_creates_mesh(self, warp_init, device, simple_intrinsics, identity_pose):
@@ -107,7 +111,8 @@ class TestMarchingCubes:
             integrator.integrate(obs)
 
         # Extract mesh
-        vertices, triangles, normals, colors = extract_mesh_block_sparse(tsdf)
+        vertices, normals, colors = extract_mesh_block_sparse(tsdf)
+        triangles = _identity_triangles(vertices)
 
         # Should have some geometry
         assert vertices.shape[0] > 0, "Should have vertices"
@@ -120,6 +125,69 @@ class TestMarchingCubes:
         # Check triangles reference valid vertices
         assert triangles.min() >= 0
         assert triangles.max() < vertices.shape[0]
+
+        # The integrated plane is observed from the camera at the origin and
+        # free space is in front of the surface, so outward normals point -Z.
+        assert normals[:, 2].mean() < -0.5
+
+        v0 = vertices[triangles[:, 0]]
+        v1 = vertices[triangles[:, 1]]
+        v2 = vertices[triangles[:, 2]]
+        face_normals = torch.nn.functional.normalize(
+            torch.cross(v1 - v0, v2 - v0, dim=1),
+            dim=1,
+        )
+        tri_normals = normals.view(-1, 3, 3).mean(dim=1)
+        winding_alignment = (face_normals * tri_normals).sum(dim=1)
+        assert winding_alignment.mean() > 0.5
+        assert face_normals[:, 2].mean() < -0.5
+
+    def test_mesh_triangle_soup(self, warp_init, device, simple_intrinsics, identity_pose):
+        """Test that mesh extraction emits triangle-soup vertices."""
+        config = BlockSparseTSDFIntegratorCfg(
+            max_blocks=2000,
+            voxel_size=0.02,
+            origin=torch.tensor([-0.5, -0.5, 0.0]),
+            grid_shape=(512, 512, 512),
+            truncation_distance=0.1,
+            device=device,
+            image_height=200,
+            image_width=200,
+        )
+        integrator = BlockSparseTSDFIntegrator(config)
+        tsdf = integrator.tsdf
+
+        depth = torch.full((200, 200), 1.0, dtype=torch.float32, device=device)
+        rgb = torch.full((200, 200, 3), 200, dtype=torch.uint8, device=device)
+        position, quaternion = identity_pose
+        obs = make_observation(depth, rgb, position, quaternion, simple_intrinsics)
+        for _ in range(10):
+            integrator.integrate(obs)
+
+        vertices, normals, colors = extract_mesh_block_sparse(tsdf)
+        triangles = _identity_triangles(vertices)
+
+        assert vertices.shape[0] > 0
+        assert triangles.shape[0] > 0
+        assert vertices.shape[0] == triangles.shape[0] * 3
+        assert normals.shape == vertices.shape
+        assert colors.shape == vertices.shape
+        assert triangles.dtype == torch.int32
+        assert torch.equal(
+            triangles.reshape(-1),
+            torch.arange(vertices.shape[0], dtype=torch.int32, device=device),
+        )
+        assert not torch.isnan(vertices).any()
+        assert triangles.min() >= 0
+        assert triangles.max() < vertices.shape[0]
+
+        refined_vertices, refined_normals, refined_colors = extract_mesh_block_sparse(
+            tsdf, refine_iterations=2
+        )
+        assert refined_vertices.shape == vertices.shape
+        assert refined_normals.shape == normals.shape
+        assert refined_colors.shape == colors.shape
+        assert not torch.isnan(refined_vertices).any()
 
     def test_mesh_vertices_near_surface(self, warp_init, device, simple_intrinsics, identity_pose):
         """Test that mesh vertices are near the depth surface."""
@@ -147,7 +215,7 @@ class TestMarchingCubes:
         for _ in range(5):
             integrator.integrate(obs)
 
-        vertices, triangles, normals, colors = extract_mesh_block_sparse(tsdf)
+        vertices, normals, colors = extract_mesh_block_sparse(tsdf)
 
         if vertices.shape[0] > 0:
             # Vertices should be near z=1.0
@@ -182,7 +250,7 @@ class TestMarchingCubes:
         for _ in range(3):
             integrator.integrate(obs)
 
-        vertices, triangles, normals, colors = extract_mesh_block_sparse(tsdf)
+        vertices, normals, colors = extract_mesh_block_sparse(tsdf)
 
         if vertices.shape[0] > 0:
             # Colors should be mostly red
@@ -228,7 +296,7 @@ class TestMarchingCubes:
             for _ in range(5):  # More passes per position
                 integrator.integrate(obs)
 
-        vertices, triangles, normals, colors = extract_mesh_block_sparse(tsdf)
+        vertices, normals, colors = extract_mesh_block_sparse(tsdf)
 
         assert vertices.shape[0] > 0, "Should have vertices from multiple views"
 
@@ -260,7 +328,8 @@ class TestMeshQuality:
         for _ in range(3):
             integrator.integrate(obs)
 
-        vertices, triangles, normals, colors = extract_mesh_block_sparse(tsdf)
+        vertices, normals, colors = extract_mesh_block_sparse(tsdf)
+        triangles = _identity_triangles(vertices)
 
         if triangles.shape[0] > 0:
             # Check for degenerate triangles

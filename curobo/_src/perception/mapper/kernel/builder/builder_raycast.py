@@ -23,10 +23,6 @@ from __future__ import annotations
 import warp as wp
 
 from curobo._src.perception.mapper.kernel.warp_types import BlockSparseTSDFWarp
-from curobo._src.perception.mapper.kernel.wp_integrate_common import (
-    quat_from_wxyz_array,
-    vec3_from_array,
-)
 from curobo._src.util.warp import warp_func, warp_kernel
 
 _SDF_INFINITY = wp.constant(wp.float32(1e10))
@@ -36,8 +32,6 @@ def make_raycast_kernels(
     block_size: int,
     *,
     hash_lookup,
-    compute_avg_rgb_from_block,
-    compute_avg_rgb_uint8_from_block,
     voxel_to_world,
     voxel_to_world_corner,
     block_grid_to_key_coords,
@@ -45,9 +39,11 @@ def make_raycast_kernels(
     world_to_block_coords,
     world_to_block_and_local,
     world_to_continuous_voxel,
+    color_grid_size: int = 1,
 ) -> dict[str, object]:
     """Build raycast and voxel-extraction kernels."""
     BS = wp.constant(block_size)
+    COLOR_GRID_SIZE = wp.constant(wp.int32(color_grid_size))
 
     # Cross-domain helpers are explicit parameters so Warp sees them as
     # local closure bindings when compiling dependent functions.
@@ -257,12 +253,57 @@ def make_raycast_kernels(
         )
         return wp.vec2(sdf, 1.0)
 
-    @warp_func(f"sample_rgb_bs{block_size}")
+    @warp_func(f"sample_block_grid_rgb_bs{block_size}_gs{color_grid_size}")
+    def sample_block_grid_rgb(
+        tsdf: BlockSparseTSDFWarp,
+        world_pos: wp.vec3,
+        pool_idx: wp.int32,
+        bx: wp.int32,
+        by: wp.int32,
+        bz: wp.int32,
+    ) -> wp.vec4:
+        """Sample weighted RGBW from the per-block RGB grid."""
+        base = block_key_to_voxel_base(bx, by, bz)
+        voxel_f = world_to_continuous_voxel(world_pos)
+        local_x = voxel_f[0] - wp.float32(base[0])
+        local_y = voxel_f[1] - wp.float32(base[1])
+        local_z = voxel_f[2] - wp.float32(base[2])
+
+        if COLOR_GRID_SIZE <= wp.int32(1) or BS <= wp.int32(1):
+            return wp.vec4(
+                wp.float32(tsdf.block_grid_rgb[pool_idx, 0, 0]),
+                wp.float32(tsdf.block_grid_rgb[pool_idx, 0, 1]),
+                wp.float32(tsdf.block_grid_rgb[pool_idx, 0, 2]),
+                wp.float32(tsdf.block_grid_rgb[pool_idx, 0, 3]),
+            )
+
+        grid_max = wp.float32(COLOR_GRID_SIZE - wp.int32(1))
+        scale = grid_max / wp.float32(BS - wp.int32(1))
+        gx_f = wp.clamp((local_x - wp.float32(0.5)) * scale, wp.float32(0.0), grid_max)
+        gy_f = wp.clamp((local_y - wp.float32(0.5)) * scale, wp.float32(0.0), grid_max)
+        gz_f = wp.clamp((local_z - wp.float32(0.5)) * scale, wp.float32(0.0), grid_max)
+
+        gx = wp.int32(wp.floor(gx_f + wp.float32(0.5)))
+        gy = wp.int32(wp.floor(gy_f + wp.float32(0.5)))
+        gz = wp.int32(wp.floor(gz_f + wp.float32(0.5)))
+        gx = wp.min(wp.max(gx, wp.int32(0)), COLOR_GRID_SIZE - wp.int32(1))
+        gy = wp.min(wp.max(gy, wp.int32(0)), COLOR_GRID_SIZE - wp.int32(1))
+        gz = wp.min(wp.max(gz, wp.int32(0)), COLOR_GRID_SIZE - wp.int32(1))
+        stride_z = COLOR_GRID_SIZE * COLOR_GRID_SIZE
+        idx = gz * stride_z + gy * COLOR_GRID_SIZE + gx
+        return wp.vec4(
+            wp.float32(tsdf.block_grid_rgb[pool_idx, idx, 0]),
+            wp.float32(tsdf.block_grid_rgb[pool_idx, idx, 1]),
+            wp.float32(tsdf.block_grid_rgb[pool_idx, idx, 2]),
+            wp.float32(tsdf.block_grid_rgb[pool_idx, idx, 3]),
+        )
+
+    @warp_func(f"sample_rgb_bs{block_size}_gs{color_grid_size}")
     def sample_rgb(
         tsdf: BlockSparseTSDFWarp,
         world_pos: wp.vec3,
     ) -> wp.vec3:
-        """Sample RGB color from TSDF struct (per-block average)."""
+        """Sample RGB color from the nearest RGB-grid node."""
         coords = world_to_block_and_local(world_pos)
         bx = coords[0]
         by = coords[1]
@@ -272,7 +313,16 @@ def make_raycast_kernels(
         if pool_idx < 0:
             return wp.vec3(0.0, 0.0, 0.0)
 
-        return compute_avg_rgb_from_block(tsdf.block_rgb, pool_idx)
+        grid_rgbw = sample_block_grid_rgb(tsdf, world_pos, pool_idx, bx, by, bz)
+        grid_w = grid_rgbw[3]
+        if grid_w <= wp.float32(1.0e-6):
+            return wp.vec3(128.0, 128.0, 128.0)
+        inv_w = wp.float32(255.0) / grid_w
+        return wp.vec3(
+            wp.clamp(grid_rgbw[0] * inv_w, wp.float32(0.0), wp.float32(255.0)),
+            wp.clamp(grid_rgbw[1] * inv_w, wp.float32(0.0), wp.float32(255.0)),
+            wp.clamp(grid_rgbw[2] * inv_w, wp.float32(0.0), wp.float32(255.0)),
+        )
 
     @warp_func(f"compute_gradient_bs{block_size}")
     def compute_gradient(
@@ -460,75 +510,67 @@ def make_raycast_kernels(
 
         return wp.min(wp.min(t_max_x, t_max_y), t_max_z)
 
-    # =====================================================================
-    # Raycast kernels (4)
-    # =====================================================================
-
-    @warp_kernel(f"raycast_block_sparse_kernel_bs{block_size}")
-    def raycast_block_sparse_kernel(
-        intrinsics: wp.array2d(dtype=wp.float32),
-        cam_position: wp.array(dtype=wp.float32),
-        cam_quaternion: wp.array(dtype=wp.float32),
+    @warp_func(f"raycast_hit_t_bs{block_size}")
+    def raycast_hit_t(
         tsdf: BlockSparseTSDFWarp,
-        depth_minimum_distance: float,
-        depth_maximum_distance: float,
-        minimum_tsdf_weight: float,
-        hit_points: wp.array2d(dtype=wp.float32),
-        hit_normals: wp.array2d(dtype=wp.float32),
-        hit_depths: wp.array(dtype=wp.float32),
-        hit_mask: wp.array(dtype=wp.uint8),
-        img_H: int,
-        img_W: int,
-    ):
-        """Raycast block-sparse TSDF (depth + normals)."""
-        tid = wp.tid()
-
-        hit_points[tid, 0] = 0.0
-        hit_points[tid, 1] = 0.0
-        hit_points[tid, 2] = 0.0
-        hit_normals[tid, 0] = 0.0
-        hit_normals[tid, 1] = 0.0
-        hit_normals[tid, 2] = 0.0
-        hit_depths[tid] = 0.0
-        hit_mask[tid] = wp.uint8(0)
-
-        px = tid % img_W
-        py = tid // img_W
-        if py >= img_H:
-            return
-
-        fx = intrinsics[0, 0]
-        fy = intrinsics[1, 1]
-        cx = intrinsics[0, 2]
-        cy = intrinsics[1, 2]
-
-        cam_pos = vec3_from_array(cam_position)
-        cam_quat = quat_from_wxyz_array(cam_quaternion)
-
-        ray_cam_x = (wp.float32(px) + 0.5 - cx) / fx
-        ray_cam_y = (wp.float32(py) + 0.5 - cy) / fy
-        ray_cam_z = 1.0
-
-        ray_len = wp.sqrt(ray_cam_x * ray_cam_x + ray_cam_y * ray_cam_y + ray_cam_z * ray_cam_z)
-        ray_cam = wp.vec3(ray_cam_x / ray_len, ray_cam_y / ray_len, ray_cam_z / ray_len)
-        ray_world = wp.quat_rotate(cam_quat, ray_cam)
-
+        cam_pos: wp.vec3,
+        ray_world: wp.vec3,
+        depth_minimum_distance: wp.float32,
+        depth_maximum_distance: wp.float32,
+        minimum_tsdf_weight: wp.float32,
+    ) -> wp.vec2:
+        """Raymarch through allocated blocks and return ``(hit_t, valid)``."""
         step_size = tsdf.voxel_size * MIN_STEP_SCALE
-        max_steps = wp.int32((depth_maximum_distance - depth_minimum_distance) / step_size) + 1
-        max_steps = wp.min(max_steps, 10000)
 
         t = float(depth_minimum_distance)
         prev_sdf = float(1e10)
         prev_t = float(depth_minimum_distance)
 
-        hit_found = bool(False)
-        hit_t = float(0.0)
+        curr_bx = wp.int32(-999999)
+        curr_by = wp.int32(-999999)
+        curr_bz = wp.int32(-999999)
+        curr_block_allocated = bool(False)
+        curr_block_exit_t = float(0.0)
 
-        for step in range(max_steps):
+        max_iterations = 10000
+
+        for iteration in range(max_iterations):
             if t > depth_maximum_distance:
                 break
 
             pos = cam_pos + ray_world * t
+
+            block_coords = world_to_block_coords(pos)
+            bx = block_coords[0]
+            by = block_coords[1]
+            bz = block_coords[2]
+
+            if bx != curr_bx or by != curr_by or bz != curr_bz:
+                curr_bx = bx
+                curr_by = by
+                curr_bz = bz
+
+                block_idx = hash_lookup(
+                    tsdf.hash_table,
+                    bx,
+                    by,
+                    bz,
+                    tsdf.hash_capacity,
+                )
+                curr_block_allocated = block_idx >= 0
+
+                curr_block_exit_t = ray_block_exit_t(
+                    cam_pos,
+                    ray_world,
+                    bx,
+                    by,
+                    bz,
+                )
+
+            if not curr_block_allocated:
+                t = curr_block_exit_t + step_size
+                prev_sdf = 1e10
+                continue
 
             sdf_result = sample_tsdf_trilinear(tsdf, pos, minimum_tsdf_weight)
             sdf = sdf_result[0]
@@ -549,15 +591,94 @@ def make_raycast_kernels(
                     sdf,
                     minimum_tsdf_weight,
                 )
-                hit_found = True
-                break
+                return wp.vec2(hit_t, 1.0)
 
             prev_sdf = sdf
             prev_t = t
             t += step_size
 
-        if not hit_found:
+        return wp.vec2(0.0, 0.0)
+
+    # =====================================================================
+    # Raycast kernels (2)
+    # =====================================================================
+
+    @warp_kernel(f"raycast_block_sparse_kernel_bs{block_size}")
+    def raycast_block_sparse_kernel(
+        intrinsics: wp.array3d(dtype=wp.float32),
+        cam_positions: wp.array2d(dtype=wp.float32),
+        cam_quaternions: wp.array2d(dtype=wp.float32),
+        tsdf: BlockSparseTSDFWarp,
+        depth_minimum_distance: float,
+        depth_maximum_distance: float,
+        minimum_tsdf_weight: float,
+        hit_points: wp.array2d(dtype=wp.float32),
+        hit_normals: wp.array2d(dtype=wp.float32),
+        hit_depths: wp.array(dtype=wp.float32),
+        hit_mask: wp.array(dtype=wp.uint8),
+        img_H: int,
+        img_W: int,
+        pixels_per_camera: int,
+    ):
+        """Raycast block-sparse TSDF (depth + normals)."""
+        tid = wp.tid()
+
+        hit_points[tid, 0] = 0.0
+        hit_points[tid, 1] = 0.0
+        hit_points[tid, 2] = 0.0
+        hit_normals[tid, 0] = 0.0
+        hit_normals[tid, 1] = 0.0
+        hit_normals[tid, 2] = 0.0
+        hit_depths[tid] = 0.0
+        hit_mask[tid] = wp.uint8(0)
+
+        camera_idx = tid // pixels_per_camera
+        pixel_tid = tid - camera_idx * pixels_per_camera
+
+        px = pixel_tid % img_W
+        py = pixel_tid // img_W
+        if py >= img_H:
             return
+
+        fx = intrinsics[camera_idx, 0, 0]
+        fy = intrinsics[camera_idx, 1, 1]
+        cx = intrinsics[camera_idx, 0, 2]
+        cy = intrinsics[camera_idx, 1, 2]
+
+        cam_pos = wp.vec3(
+            cam_positions[camera_idx, 0],
+            cam_positions[camera_idx, 1],
+            cam_positions[camera_idx, 2],
+        )
+        cam_quat = wp.quat(
+            cam_quaternions[camera_idx, 1],
+            cam_quaternions[camera_idx, 2],
+            cam_quaternions[camera_idx, 3],
+            cam_quaternions[camera_idx, 0],
+        )
+
+        ray_cam_x = (wp.float32(px) + 0.5 - cx) / fx
+        ray_cam_y = (wp.float32(py) + 0.5 - cy) / fy
+        ray_cam_z_raw = 1.0
+
+        ray_len = wp.sqrt(
+            ray_cam_x * ray_cam_x + ray_cam_y * ray_cam_y + ray_cam_z_raw * ray_cam_z_raw
+        )
+        ray_cam_z = ray_cam_z_raw / ray_len
+        ray_cam = wp.vec3(ray_cam_x / ray_len, ray_cam_y / ray_len, ray_cam_z)
+        ray_world = wp.quat_rotate(cam_quat, ray_cam)
+
+        hit = raycast_hit_t(
+            tsdf,
+            cam_pos,
+            ray_world,
+            depth_minimum_distance,
+            depth_maximum_distance,
+            minimum_tsdf_weight,
+        )
+        if hit[1] < 0.5:
+            return
+        hit_t = hit[0]
 
         hit_pos = cam_pos + ray_world * hit_t
         normal = compute_gradient(tsdf, hit_pos, minimum_tsdf_weight)
@@ -574,9 +695,9 @@ def make_raycast_kernels(
 
     @warp_kernel(f"raycast_block_sparse_color_kernel_bs{block_size}")
     def raycast_block_sparse_color_kernel(
-        intrinsics: wp.array2d(dtype=wp.float32),
-        cam_position: wp.array(dtype=wp.float32),
-        cam_quaternion: wp.array(dtype=wp.float32),
+        intrinsics: wp.array3d(dtype=wp.float32),
+        cam_positions: wp.array2d(dtype=wp.float32),
+        cam_quaternions: wp.array2d(dtype=wp.float32),
         tsdf: BlockSparseTSDFWarp,
         depth_minimum_distance: float,
         depth_maximum_distance: float,
@@ -588,6 +709,7 @@ def make_raycast_kernels(
         hit_mask: wp.array(dtype=wp.uint8),
         img_H: int,
         img_W: int,
+        pixels_per_camera: int,
     ):
         """Raycast block-sparse TSDF with color output."""
         tid = wp.tid()
@@ -604,371 +726,53 @@ def make_raycast_kernels(
         hit_depths[tid] = 0.0
         hit_mask[tid] = wp.uint8(0)
 
-        px = tid % img_W
-        py = tid // img_W
+        camera_idx = tid // pixels_per_camera
+        pixel_tid = tid - camera_idx * pixels_per_camera
+
+        px = pixel_tid % img_W
+        py = pixel_tid // img_W
         if py >= img_H:
             return
 
-        fx = intrinsics[0, 0]
-        fy = intrinsics[1, 1]
-        cx = intrinsics[0, 2]
-        cy = intrinsics[1, 2]
+        fx = intrinsics[camera_idx, 0, 0]
+        fy = intrinsics[camera_idx, 1, 1]
+        cx = intrinsics[camera_idx, 0, 2]
+        cy = intrinsics[camera_idx, 1, 2]
 
-        cam_pos = vec3_from_array(cam_position)
-        cam_quat = quat_from_wxyz_array(cam_quaternion)
-
-        ray_cam_x = (wp.float32(px) + 0.5 - cx) / fx
-        ray_cam_y = (wp.float32(py) + 0.5 - cy) / fy
-        ray_cam_z = 1.0
-
-        ray_len = wp.sqrt(ray_cam_x * ray_cam_x + ray_cam_y * ray_cam_y + ray_cam_z * ray_cam_z)
-        ray_cam = wp.vec3(ray_cam_x / ray_len, ray_cam_y / ray_len, ray_cam_z / ray_len)
-        ray_world = wp.quat_rotate(cam_quat, ray_cam)
-
-        step_size = tsdf.voxel_size * MIN_STEP_SCALE
-        max_steps = wp.int32((depth_maximum_distance - depth_minimum_distance) / step_size) + 1
-        max_steps = wp.min(max_steps, 200000)
-
-        t = float(depth_minimum_distance)
-        prev_sdf = float(1e10)
-        prev_t = float(depth_minimum_distance)
-
-        hit_found = bool(False)
-        hit_t = float(0.0)
-
-        for step in range(max_steps):
-            if t > depth_maximum_distance:
-                break
-
-            pos = cam_pos + ray_world * t
-            sdf_result = sample_tsdf_trilinear(tsdf, pos, minimum_tsdf_weight)
-            sdf = sdf_result[0]
-            valid = sdf_result[1]
-
-            if valid < 0.5:
-                t += step_size
-                continue
-
-            if prev_sdf < 1e9 and prev_sdf > 0.0 and sdf < 0.0:
-                hit_t = refine_hit_bisection(
-                    tsdf,
-                    cam_pos,
-                    ray_world,
-                    prev_t,
-                    t,
-                    prev_sdf,
-                    sdf,
-                    minimum_tsdf_weight,
-                )
-                hit_found = True
-                break
-
-            prev_sdf = sdf
-            prev_t = t
-            t += step_size
-
-        if not hit_found:
-            return
-
-        hit_pos = cam_pos + ray_world * hit_t
-        normal = compute_gradient(tsdf, hit_pos, minimum_tsdf_weight)
-        color = sample_rgb(tsdf, hit_pos)
-        z_depth = hit_t * ray_cam_z
-
-        hit_points[tid, 0] = hit_pos[0]
-        hit_points[tid, 1] = hit_pos[1]
-        hit_points[tid, 2] = hit_pos[2]
-        hit_normals[tid, 0] = normal[0]
-        hit_normals[tid, 1] = normal[1]
-        hit_normals[tid, 2] = normal[2]
-        hit_colors[tid, 0] = wp.uint8(color[0])
-        hit_colors[tid, 1] = wp.uint8(color[1])
-        hit_colors[tid, 2] = wp.uint8(color[2])
-        hit_depths[tid] = z_depth
-        hit_mask[tid] = wp.uint8(1)
-
-    @warp_kernel(f"raycast_block_sparse_accelerated_kernel_bs{block_size}")
-    def raycast_block_sparse_accelerated_kernel(
-        intrinsics: wp.array2d(dtype=wp.float32),
-        cam_position: wp.array(dtype=wp.float32),
-        cam_quaternion: wp.array(dtype=wp.float32),
-        tsdf: BlockSparseTSDFWarp,
-        depth_minimum_distance: float,
-        depth_maximum_distance: float,
-        minimum_tsdf_weight: float,
-        hit_points: wp.array2d(dtype=wp.float32),
-        hit_normals: wp.array2d(dtype=wp.float32),
-        hit_depths: wp.array(dtype=wp.float32),
-        hit_mask: wp.array(dtype=wp.uint8),
-        img_H: int,
-        img_W: int,
-    ):
-        """Block-accelerated raycast (skip unallocated blocks)."""
-        tid = wp.tid()
-
-        hit_points[tid, 0] = 0.0
-        hit_points[tid, 1] = 0.0
-        hit_points[tid, 2] = 0.0
-        hit_normals[tid, 0] = 0.0
-        hit_normals[tid, 1] = 0.0
-        hit_normals[tid, 2] = 0.0
-        hit_depths[tid] = 0.0
-        hit_mask[tid] = wp.uint8(0)
-
-        px = tid % img_W
-        py = tid // img_W
-        if py >= img_H:
-            return
-
-        fx = intrinsics[0, 0]
-        fy = intrinsics[1, 1]
-        cx = intrinsics[0, 2]
-        cy = intrinsics[1, 2]
-
-        cam_pos = vec3_from_array(cam_position)
-        cam_quat = quat_from_wxyz_array(cam_quaternion)
+        cam_pos = wp.vec3(
+            cam_positions[camera_idx, 0],
+            cam_positions[camera_idx, 1],
+            cam_positions[camera_idx, 2],
+        )
+        cam_quat = wp.quat(
+            cam_quaternions[camera_idx, 1],
+            cam_quaternions[camera_idx, 2],
+            cam_quaternions[camera_idx, 3],
+            cam_quaternions[camera_idx, 0],
+        )
 
         ray_cam_x = (wp.float32(px) + 0.5 - cx) / fx
         ray_cam_y = (wp.float32(py) + 0.5 - cy) / fy
-        ray_cam_z = 1.0
+        ray_cam_z_raw = 1.0
 
-        ray_len = wp.sqrt(ray_cam_x * ray_cam_x + ray_cam_y * ray_cam_y + ray_cam_z * ray_cam_z)
-        ray_cam = wp.vec3(ray_cam_x / ray_len, ray_cam_y / ray_len, ray_cam_z / ray_len)
+        ray_len = wp.sqrt(
+            ray_cam_x * ray_cam_x + ray_cam_y * ray_cam_y + ray_cam_z_raw * ray_cam_z_raw
+        )
+        ray_cam_z = ray_cam_z_raw / ray_len
+        ray_cam = wp.vec3(ray_cam_x / ray_len, ray_cam_y / ray_len, ray_cam_z)
         ray_world = wp.quat_rotate(cam_quat, ray_cam)
 
-        step_size = tsdf.voxel_size * MIN_STEP_SCALE
-
-        t = float(depth_minimum_distance)
-        prev_sdf = float(1e10)
-        prev_t = float(depth_minimum_distance)
-
-        hit_found = bool(False)
-        hit_t = float(0.0)
-
-        curr_bx = wp.int32(-999999)
-        curr_by = wp.int32(-999999)
-        curr_bz = wp.int32(-999999)
-        curr_block_allocated = bool(False)
-        curr_block_exit_t = float(0.0)
-
-        max_iterations = 10000
-
-        for iteration in range(max_iterations):
-            if t > depth_maximum_distance:
-                break
-
-            pos = cam_pos + ray_world * t
-
-            block_coords = world_to_block_coords(pos)
-            bx = block_coords[0]
-            by = block_coords[1]
-            bz = block_coords[2]
-
-            if bx != curr_bx or by != curr_by or bz != curr_bz:
-                curr_bx = bx
-                curr_by = by
-                curr_bz = bz
-
-                block_idx = hash_lookup(
-                    tsdf.hash_table,
-                    bx,
-                    by,
-                    bz,
-                    tsdf.hash_capacity,
-                )
-                curr_block_allocated = block_idx >= 0
-
-                curr_block_exit_t = ray_block_exit_t(
-                    cam_pos,
-                    ray_world,
-                    bx,
-                    by,
-                    bz,
-                )
-
-            if not curr_block_allocated:
-                t = curr_block_exit_t + step_size
-                prev_sdf = 1e10
-                continue
-
-            sdf_result = sample_tsdf_trilinear(tsdf, pos, minimum_tsdf_weight)
-            sdf = sdf_result[0]
-            valid = sdf_result[1]
-
-            if valid < 0.5:
-                t += step_size
-                continue
-
-            if prev_sdf < 1e9 and prev_sdf > 0.0 and sdf < 0.0:
-                hit_t = refine_hit_bisection(
-                    tsdf,
-                    cam_pos,
-                    ray_world,
-                    prev_t,
-                    t,
-                    prev_sdf,
-                    sdf,
-                    minimum_tsdf_weight,
-                )
-                hit_found = True
-                break
-
-            prev_sdf = sdf
-            prev_t = t
-            t += step_size
-
-        if not hit_found:
+        hit = raycast_hit_t(
+            tsdf,
+            cam_pos,
+            ray_world,
+            depth_minimum_distance,
+            depth_maximum_distance,
+            minimum_tsdf_weight,
+        )
+        if hit[1] < 0.5:
             return
-
-        hit_pos = cam_pos + ray_world * hit_t
-        normal = compute_gradient(tsdf, hit_pos, minimum_tsdf_weight)
-        z_depth = hit_t * ray_cam_z
-
-        hit_points[tid, 0] = hit_pos[0]
-        hit_points[tid, 1] = hit_pos[1]
-        hit_points[tid, 2] = hit_pos[2]
-        hit_normals[tid, 0] = normal[0]
-        hit_normals[tid, 1] = normal[1]
-        hit_normals[tid, 2] = normal[2]
-        hit_depths[tid] = z_depth
-        hit_mask[tid] = wp.uint8(1)
-
-    @warp_kernel(f"raycast_block_sparse_accelerated_color_kernel_bs{block_size}")
-    def raycast_block_sparse_accelerated_color_kernel(
-        intrinsics: wp.array2d(dtype=wp.float32),
-        cam_position: wp.array(dtype=wp.float32),
-        cam_quaternion: wp.array(dtype=wp.float32),
-        tsdf: BlockSparseTSDFWarp,
-        depth_minimum_distance: float,
-        depth_maximum_distance: float,
-        minimum_tsdf_weight: float,
-        hit_points: wp.array2d(dtype=wp.float32),
-        hit_normals: wp.array2d(dtype=wp.float32),
-        hit_colors: wp.array2d(dtype=wp.uint8),
-        hit_depths: wp.array(dtype=wp.float32),
-        hit_mask: wp.array(dtype=wp.uint8),
-        img_H: int,
-        img_W: int,
-    ):
-        """Block-accelerated raycast with color output."""
-        tid = wp.tid()
-
-        hit_points[tid, 0] = 0.0
-        hit_points[tid, 1] = 0.0
-        hit_points[tid, 2] = 0.0
-        hit_normals[tid, 0] = 0.0
-        hit_normals[tid, 1] = 0.0
-        hit_normals[tid, 2] = 0.0
-        hit_colors[tid, 0] = wp.uint8(0)
-        hit_colors[tid, 1] = wp.uint8(0)
-        hit_colors[tid, 2] = wp.uint8(0)
-        hit_depths[tid] = 0.0
-        hit_mask[tid] = wp.uint8(0)
-
-        px = tid % img_W
-        py = tid // img_W
-        if py >= img_H:
-            return
-
-        fx = intrinsics[0, 0]
-        fy = intrinsics[1, 1]
-        cx = intrinsics[0, 2]
-        cy = intrinsics[1, 2]
-
-        cam_pos = vec3_from_array(cam_position)
-        cam_quat = quat_from_wxyz_array(cam_quaternion)
-
-        ray_cam_x = (wp.float32(px) + 0.5 - cx) / fx
-        ray_cam_y = (wp.float32(py) + 0.5 - cy) / fy
-        ray_cam_z = 1.0
-
-        ray_len = wp.sqrt(ray_cam_x * ray_cam_x + ray_cam_y * ray_cam_y + ray_cam_z * ray_cam_z)
-        ray_cam = wp.vec3(ray_cam_x / ray_len, ray_cam_y / ray_len, ray_cam_z / ray_len)
-        ray_world = wp.quat_rotate(cam_quat, ray_cam)
-
-        step_size = tsdf.voxel_size * MIN_STEP_SCALE
-
-        t = float(depth_minimum_distance)
-        prev_sdf = float(1e10)
-        prev_t = float(depth_minimum_distance)
-
-        hit_found = bool(False)
-        hit_t = float(0.0)
-
-        curr_bx = wp.int32(-999999)
-        curr_by = wp.int32(-999999)
-        curr_bz = wp.int32(-999999)
-        curr_block_allocated = bool(False)
-        curr_block_exit_t = float(0.0)
-
-        max_iterations = 10000
-
-        for iteration in range(max_iterations):
-            if t > depth_maximum_distance:
-                break
-
-            pos = cam_pos + ray_world * t
-
-            block_coords = world_to_block_coords(pos)
-            bx = block_coords[0]
-            by = block_coords[1]
-            bz = block_coords[2]
-
-            if bx != curr_bx or by != curr_by or bz != curr_bz:
-                curr_bx = bx
-                curr_by = by
-                curr_bz = bz
-
-                block_idx = hash_lookup(
-                    tsdf.hash_table,
-                    bx,
-                    by,
-                    bz,
-                    tsdf.hash_capacity,
-                )
-                curr_block_allocated = block_idx >= 0
-
-                curr_block_exit_t = ray_block_exit_t(
-                    cam_pos,
-                    ray_world,
-                    bx,
-                    by,
-                    bz,
-                )
-
-            if not curr_block_allocated:
-                t = curr_block_exit_t + step_size
-                prev_sdf = 1e10
-                continue
-
-            sdf_result = sample_tsdf_trilinear(tsdf, pos, minimum_tsdf_weight)
-            sdf = sdf_result[0]
-            valid = sdf_result[1]
-
-            if valid < 0.5:
-                t += step_size
-                continue
-
-            if prev_sdf < 1e9 and prev_sdf > 0.0 and sdf < 0.0:
-                hit_t = refine_hit_bisection(
-                    tsdf,
-                    cam_pos,
-                    ray_world,
-                    prev_t,
-                    t,
-                    prev_sdf,
-                    sdf,
-                    minimum_tsdf_weight,
-                )
-                hit_found = True
-                break
-
-            prev_sdf = sdf
-            prev_t = t
-            t += step_size
-
-        if not hit_found:
-            return
+        hit_t = hit[0]
 
         hit_pos = cam_pos + ray_world * hit_t
         normal = compute_gradient(tsdf, hit_pos, minimum_tsdf_weight)
@@ -1245,7 +1049,7 @@ def make_raycast_kernels(
 
         out_sdf[slot] = sdf
 
-        rgb = compute_avg_rgb_uint8_from_block(tsdf.block_rgb, block_idx)
+        rgb = sample_rgb(tsdf, world_pos)
         out_colors[slot, 0] = wp.uint8(rgb[0])
         out_colors[slot, 1] = wp.uint8(rgb[1])
         out_colors[slot, 2] = wp.uint8(rgb[2])
@@ -1263,10 +1067,6 @@ def make_raycast_kernels(
         "ray_block_exit_t": ray_block_exit_t,
         "raycast_block_sparse_kernel": raycast_block_sparse_kernel,
         "raycast_block_sparse_color_kernel": raycast_block_sparse_color_kernel,
-        "raycast_block_sparse_accelerated_kernel": raycast_block_sparse_accelerated_kernel,
-        "raycast_block_sparse_accelerated_color_kernel": (
-            raycast_block_sparse_accelerated_color_kernel
-        ),
         "count_surface_voxels_kernel": count_surface_voxels_kernel,
         "count_occupied_voxels_kernel": count_occupied_voxels_kernel,
         "count_occupied_voxels_masked_kernel": count_occupied_voxels_masked_kernel,
