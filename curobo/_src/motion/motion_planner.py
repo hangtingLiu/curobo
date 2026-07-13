@@ -260,9 +260,19 @@ class MotionPlanner:
                 continue
 
             seed_config = ik_result.solution
-            if success_count < num_seeds:
-                good_solution = seed_config[ik_result.success][0:1, :].clone()
-                seed_config[~ik_result.success][:, :] = good_solution
+            if torch.any(~ik_result.success):
+                for batch_idx in range(seed_config.shape[0]):
+                    success_mask = ik_result.success[batch_idx]
+                    if not torch.any(success_mask):
+                        continue
+                    failed_mask = ~success_mask
+                    if not torch.any(failed_mask):
+                        continue
+                    good_solution = seed_config[batch_idx, success_mask][0:1, :].clone()
+                    seed_config[batch_idx, failed_mask, :] = good_solution.expand(
+                        int(torch.count_nonzero(failed_mask).item()),
+                        -1,
+                    )
 
             seed_traj = None
             finetune_attempts = 1
