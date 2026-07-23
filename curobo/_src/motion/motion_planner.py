@@ -249,7 +249,7 @@ class MotionPlanner:
         enable_graph_attempt: int,
         return_seeds: int,
     ) -> Optional[TrajOptSolverResult]:
-        """Single-goal planning with retry, seed repair, and graph seeding."""
+        """Single-goal planning with retry, ranked IK seeds, and graph seeding."""
         trajopt_result = None
         total_time = 0.0
         solve_time = 0.0
@@ -271,19 +271,6 @@ class MotionPlanner:
                 continue
 
             seed_config = ik_result.solution
-            if torch.any(~ik_result.success):
-                for batch_idx in range(seed_config.shape[0]):
-                    success_mask = ik_result.success[batch_idx]
-                    if not torch.any(success_mask):
-                        continue
-                    failed_mask = ~success_mask
-                    if not torch.any(failed_mask):
-                        continue
-                    good_solution = seed_config[batch_idx, success_mask][0:1, :].clone()
-                    seed_config[batch_idx, failed_mask, :] = good_solution.expand(
-                        int(torch.count_nonzero(failed_mask).item()),
-                        -1,
-                    )
 
             seed_traj = None
             finetune_attempts = 1

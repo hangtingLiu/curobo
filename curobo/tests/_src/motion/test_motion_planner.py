@@ -3,6 +3,10 @@
 #
 """Unit tests for MotionPlanner class."""
 
+# Standard Library
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 # Third Party
 import pytest
 import torch
@@ -1410,7 +1414,44 @@ class TestMotionPlannerKinematicsProperty:
 
 
 class TestMotionPlannerPartialIKSuccess:
-    """Test MotionPlanner partial IK success path (lines 135-136)."""
+    """Test MotionPlanner behavior when only some IK candidates succeed."""
+
+    def test_failed_ik_candidates_are_forwarded_to_trajopt(self):
+        """Preserve ranked failed IK candidates as TrajOpt initial guesses."""
+        planner = MotionPlanner.__new__(MotionPlanner)
+        planner._destroyed = True
+        planner.graph_planner = None
+
+        ik_solution = torch.tensor([[[0.1, 0.2], [0.8, 0.9]]], dtype=torch.float32)
+        expected_seed_config = ik_solution.clone()
+        planner.ik_solver = MagicMock()
+        planner.ik_solver.solve_pose.return_value = SimpleNamespace(
+            solution=ik_solution,
+            success=torch.tensor([[True, False]]),
+            total_time=0.1,
+            solve_time=0.05,
+        )
+
+        trajopt_result = SimpleNamespace(
+            success=torch.tensor([[True, False]]),
+            total_time=0.2,
+            solve_time=0.1,
+        )
+        planner.trajopt_solver = MagicMock()
+        planner.trajopt_solver.config.num_seeds = 2
+        planner.trajopt_solver.solve_pose.return_value = trajopt_result
+
+        current_state = JointState.from_position(torch.zeros((1, 2), dtype=torch.float32))
+        planner._plan_pose_single(
+            MagicMock(),
+            current_state,
+            max_attempts=1,
+            enable_graph_attempt=1,
+            return_seeds=1,
+        )
+
+        forwarded_seed_config = planner.trajopt_solver.solve_pose.call_args.kwargs["seed_config"]
+        torch.testing.assert_close(forwarded_seed_config, expected_seed_config)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_plan_pose_partial_ik_success(
